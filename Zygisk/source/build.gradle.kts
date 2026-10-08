@@ -25,6 +25,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    // v2.1：共享核心 common/LivePhotoCodec.java（纯 JVM，与 LSPosed 版共用）
+    sourceSets {
+        named("main") {
+            java.srcDir("../../common")
+        }
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/**"

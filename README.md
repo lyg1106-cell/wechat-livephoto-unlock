@@ -47,8 +47,16 @@
 4. 强制停止微信并重新打开
 
 **文件**：
-- `LSPosed-backup.apk` / `LivePhotoUnlock-enhanced-v2.apk` — 模块 APK
+- `LSPosed-backup.apk` — 模块 APK（v2.1 起移除重复的 `LivePhotoUnlock-enhanced-v2.apk`，与其字节完全相同）
 - `LivePhotoUnlockHook-enhanced.kt` / `DexProbe.kt` — 源码
+- `../../common/LivePhotoCodec.java` — 与 Zygisk 版共用的纯 JVM 共享核心（编解码/检测/配置键表）；LSPosed 构建时把 `common` 加入 sourceSets 即可
+
+### 3️⃣ 共享核心（`common/`，v2.1 新增）
+
+纯 JVM、无 Android 依赖：`me.livephoto.common.LivePhotoCodec`。
+LSPosed（Kotlin）与 Zygisk（Java）共用一套实现，修一处两边生效：
+MP4 box 解析（ftyp/mvhd/tkhd）、实况文件检测、内嵌视频定位与流式拷贝、
+expt JSON 构造、Repairer 配置键表。
 
 ### 2️⃣ Zygisk 版（`Zygisk/`）
 
@@ -108,6 +116,24 @@
 ## 📥 下载
 
 前往 [**Releases**](https://github.com/lyg1106-cell/wechat-livephoto-unlock/releases) 下载最新版本。
+
+---
+
+## 🆕 v2.1 优化（2026-10-08）
+
+**性能（高优先级）**
+- 视频提取改为真·流式：尾部窗口逆向定位 ftyp 后分段拷贝，不再整文件 `readBytes`（100MB+ 实况不再大堆分配）；时长/宽高只读视频头尾有限区域解析
+- 导出合成去掉 `ib + vb` 第三份内存拷贝，改为 File 流式拼接；图像只做 JPEG 魔数校验（2 字节）不再读入内容
+- 缩略图只流式读取 `[0, 视频起始)` 的 JPEG 头部
+- Zygisk 版 ftyp 定位从"头部 8MB 正向"改为"尾部窗口逆向"，JPEG 部分超 8MB 的大底照片不再漏检；删除无调用的 `extractEmbeddedMp4`（曾最多分配 512MB）
+
+**启动与维护（中优先级）**
+- DexProbe 结果按微信 versionCode 缓存（SharedPreferences），命中后跳过全量 dex 扫描
+- MMKV 批量写完一次 `sync`（原逐 key sync）
+- 新增 `common/LivePhotoCodec.java` 纯 JVM 共享核心，LSPosed / Zygisk 共用编解码与配置逻辑，删掉约 300 行重复代码
+
+**仓库卫生**
+- 移除与 `LSPosed-backup.apk` 字节完全相同的重复 APK
 
 ---
 

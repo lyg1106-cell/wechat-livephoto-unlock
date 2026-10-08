@@ -8,8 +8,9 @@ import android.provider.MediaStore;
 import android.util.Log;
 
 import java.io.File;
-import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
+
+import me.livephoto.common.LivePhotoCodec;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -289,11 +290,65 @@ public final class LivePhotoHooks {
         } catch (Throwable ignored) {}
     }
 
+    // ==================== DexProbe 缓存（v2.1：按微信 versionCode 缓存，避免每次启动全量扫描 dex） ====================
+
+    private static final String PREFS_DEXPROBE = "livephoto_dexprobe";
+    private static long sProbeCacheVer = 0;
+    private static DexProbe.Remux sCachedRemux = null;
+
+    private static long wechatVersionCode() {
+        try {
+            if (sAppContext == null) return 0;
+            android.content.pm.PackageInfo pi = sAppContext.getPackageManager()
+                    .getPackageInfo("com.tencent.mm", 0);
+            return pi.getLongVersionCode();
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /** remux 探测结果缓存（worker chat sns result 空格分隔序列化）；存 "" 表示阴性结果 */
+    private static DexProbe.Remux cachedRemux() {
+        long ver = wechatVersionCode();
+        if (sAppContext == null || ver == 0) {
+            String apkPath = DexProbe.findWeChatApkPath();
+            return apkPath != null ? DexProbe.findRemux(apkPath) : null;
+        }
+        if (sProbeCacheVer == ver && sCachedRemux != null) return sCachedRemux;
+        try {
+            android.content.SharedPreferences prefs =
+                    sAppContext.getSharedPreferences(PREFS_DEXPROBE, Context.MODE_PRIVATE);
+            String ck = "v" + ver + ":remux";
+            String cached = prefs.getString(ck, null);
+            if (cached != null) {
+                Log.d(TAG, "dexprobe cache hit: " + ck);
+                if (cached.isEmpty()) return null;
+                String[] parts = cached.split(" ");
+                if (parts.length == 4) {
+                    DexProbe.Remux r = new DexProbe.Remux(parts[0], parts[1], parts[2], parts[3]);
+                    sCachedRemux = r;
+                    sProbeCacheVer = ver;
+                    return r;
+                }
+            }
+            String apkPath = DexProbe.findWeChatApkPath();
+            DexProbe.Remux r = apkPath != null ? DexProbe.findRemux(apkPath) : null;
+            prefs.edit().putString(ck, r != null
+                    ? r.worker + " " + r.chat + " " + r.sns + " " + r.result : "").apply();
+            sCachedRemux = r;
+            sProbeCacheVer = ver;
+            return r;
+        } catch (Throwable t) {
+            String apkPath = DexProbe.findWeChatApkPath();
+            return apkPath != null ? DexProbe.findRemux(apkPath) : null;
+        }
+    }
+
     /** Remux 直通：跳过转码直接复制文件（聊天 + 朋友圈），DexProbe 动态定位 */
     private static void hookRemux() {
         try {
-            String apkPath = DexProbe.findWeChatApkPath();
-            DexProbe.Remux probed = apkPath != null ? DexProbe.findRemux(apkPath) : null;
+            // v2.1：走缓存（按微信 versionCode，避免每次启动全量扫描 dex）
+            DexProbe.Remux probed = cachedRemux();
             String[] remuxWorkers;
             if (probed != null && probed.worker != null) {
                 remuxWorkers = new String[]{probed.worker};
@@ -376,67 +431,14 @@ public final class LivePhotoHooks {
         return null;
     }
 
-    /** 检测 Motion Photo：文件尾部 MP4 ftyp 特征 + XMP 元数据 */
+    /** 检测 Motion Photo：共享核心（头部 XMP 快检 + 尾部 ftyp 兜底，全程不整文件加载） */
     private static boolean hasMotionPhoto(String path) {
-        try {
-            File f = new File(path);
-            if (!f.isFile() || f.length() < 64) return false;
-            long len = f.length();
-            // 1) 头部 128KB XMP 快检（byte 级查找，避免 String 分配）
-            int headLen = (int) Math.min(len, 131072);
-            byte[] head = new byte[headLen];
-            try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
-                raf.seek(0);
-                raf.readFully(head);
-            }
-            if (containsAscii(head, "MotionPhoto") || containsAscii(head, "MicroVideo") || containsAscii(head, "GCamera")) {
-                return true;
-            }
-            // 2) 尾部 ftyp 兜底（12MB 窗口）
-            int tailLen = (int) Math.min(len, 12L * 1024 * 1024);
-            byte[] tail = new byte[tailLen];
-            try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
-                raf.seek(len - tailLen);
-                raf.readFully(tail);
-            }
-            return containsAscii(tail, "ftyp");
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    /** byte[] 中查找 ASCII 子串（比 String 构造快，避免大内存分配） */
-    private static boolean containsAscii(byte[] haystack, String needle) {
-        byte[] n = needle.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-        int last = haystack.length - n.length;
-        outer:
-        for (int i = 0; i <= last; i++) {
-            for (int j = 0; j < n.length; j++) {
-                if (haystack[i + j] != n[j]) continue outer;
-            }
-            return true;
-        }
-        return false;
-    }
-
-    /** byte[] 中查找 ASCII 子串返回下标（-1 未找到） */
-    private static int indexOfAscii(byte[] haystack, String needle) {
-        byte[] n = needle.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-        int last = haystack.length - n.length;
-        outer:
-        for (int i = 0; i <= last; i++) {
-            for (int j = 0; j < n.length; j++) {
-                if (haystack[i + j] != n[j]) continue outer;
-            }
-            return i;
-        }
-        return -1;
+        return LivePhotoCodec.isMotionPhotoFile(path);
     }
 
     /** 提取内嵌 MP4 到 savePath，返回微信约定 JSON（完整格式） */
     private static String tryExtractVideo(long mediaId, String savePath) {
         final String Q = "\"";
-        RandomAccessFile raf = null;
         try {
             if (savePath == null || savePath.isEmpty()) return null;
             String imgPath = resolveImagePath(mediaId);
@@ -445,47 +447,26 @@ public final class LivePhotoHooks {
             if (!img.isFile()) return null;
             long fileLen = img.length();
 
-            raf = new RandomAccessFile(img, "r");
-
-            // 1) 只读头部 8MB 找 ftyp（覆盖 ftyp 在 2~3MB 的图，如 DCIM/Live 的魅族实况）
-            int headRead = (int) Math.min(fileLen, 8 * 1024 * 1024L);
-            byte[] head = new byte[headRead];
-            raf.seek(0);
-            raf.readFully(head);
-            int off = findFtyp(head);
+            // 1) v2.1：尾部窗口逆向定位 ftyp（视频在文件尾部；旧逻辑只在头部 8MB 正向找，
+            //    JPEG 部分超过 8MB 的大底照片会漏检）
+            long off = LivePhotoCodec.findVideoOffsetInFile(img);
             if (off < 0) {
-                Log.w(TAG, "tryExtractVideo: no ftyp in head 8MB of " + imgPath + " (len=" + fileLen + ")");
+                Log.w(TAG, "tryExtractVideo: no ftyp in tail window of " + imgPath + " (len=" + fileLen + ")");
                 return null;
             }
 
-            // 2) 流式复制 [ftyp_off, EOF) 到 savePath（不整文件读入内存）
+            // 2) v2.1：流式复制 [ftyp_off, EOF) 到 savePath（共享核心，不整文件读入内存）
             File dst = new File(savePath);
-            if (dst.getParentFile() != null) dst.getParentFile().mkdirs();
-            long videoLen = 0;
-            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(dst)) {
-                raf.seek(off);
-                byte[] buf = new byte[64 * 1024];
-                int n;
-                while ((n = raf.read(buf)) > 0) {
-                    fos.write(buf, 0, n);
-                    videoLen += n;
-                }
-                fos.flush();
+            long videoLen = LivePhotoCodec.streamCopyRange(img, off, dst);
+            if (videoLen <= 0) {
+                Log.w(TAG, "tryExtractVideo: stream copy failed for " + imgPath);
+                return null;
             }
 
-            // 3) 解析时长/宽高：只读写入的视频文件尾部 4MB（moov/mvhd/tkhd 通常靠近文件尾）
-            long dur = 0;
-            int w = 0, h = 0;
-            try (RandomAccessFile vraf = new RandomAccessFile(dst, "r")) {
-                long vLen = vraf.length();
-                int tailRead = (int) Math.min(vLen, 4 * 1024 * 1024L);
-                byte[] tail = new byte[tailRead];
-                vraf.seek(vLen - tailRead);
-                vraf.readFully(tail);
-                dur = parseMvhdDurationMs(tail, 0);
-                int[] wh = parseTkhdSize(tail, 0);
-                w = wh[0]; h = wh[1];
-            }
+            // 3) v2.1：解析时长/宽高——共享核心，头部 1MB + 尾部 4MB 有限区域解析
+            long[] meta = LivePhotoCodec.parseVideoMeta(dst);
+            long dur = meta[0];
+            int w = (int) meta[1], h = (int) meta[2];
 
             String durField = dur > 0 ? "," + Q + "videoDuration" + Q + ":" + dur : "";
             String sizeField = (w > 0 && h > 0)
@@ -498,155 +479,8 @@ public final class LivePhotoHooks {
         } catch (Throwable t) {
             Log.e(TAG, "tryExtractVideo failed", t);
             return null;
-        } finally {
-            if (raf != null) { try { raf.close(); } catch (Throwable ignored) {} }
         }
     }
-    /** 从尾部往前找 ftyp box（MP4 起始） */
-    private static int findFtyp(byte[] buf) {
-        int p = indexOfAscii(buf, "ftyp");
-        if (p < 0) return -1;
-        int sizeOff = p - 4;
-        if (sizeOff < 0) return -1;
-        int sz = (buf[sizeOff] & 0xff) << 24 | (buf[sizeOff+1] & 0xff) << 16 |
-            (buf[sizeOff+2] & 0xff) << 8 | (buf[sizeOff+3] & 0xff);
-        if (sz >= 8 && sz < 200_000_000) return sizeOff;
-        // 首个 ftyp size 非法，尝试继续找下一个（从 sizeOff+8 起）
-        int i = sizeOff + 8;
-        while (i < buf.length) {
-            int p2 = -1;
-            for (int j = i; j <= buf.length - 4; j++) {
-                if (buf[j]=='f' && buf[j+1]=='t' && buf[j+2]=='y' && buf[j+3]=='p') { p2 = j; break; }
-            }
-            if (p2 < 0) return -1;
-            int so = p2 - 4;
-            if (so >= 0) {
-                int s2 = (buf[so] & 0xff) << 24 | (buf[so+1] & 0xff) << 16 |
-                    (buf[so+2] & 0xff) << 8 | (buf[so+3] & 0xff);
-                if (s2 >= 8 && s2 < 200_000_000) return so;
-            }
-            i = p2 + 4;
-        }
-        return -1;
-    }
-
-
-    /** 解析 mvhd 时长（毫秒） */
-    private static long parseMvhdDurationMs(byte[] data, int from) {
-        try {
-            int i = from;
-            int end = data.length - 4;
-            while (i < end) {
-                if (data[i] == 'm' && data[i+1] == 'v' && data[i+2] == 'h' && data[i+3] == 'd') {
-                    int boxSize = readI32(data, i - 4);
-                    if (boxSize >= 80 && boxSize <= 4096) {
-                        int p = i + 4;
-                        long dur;
-                        if (data[p] == 1) {
-                            long ts = readI32(data, p + 20) & 0xFFFFFFFFL;
-                            long du = readI64(data, p + 24);
-                            if (ts > 0) dur = du * 1000 / ts; else dur = 0;
-                        } else {
-                            long ts = readI32(data, p + 12) & 0xFFFFFFFFL;
-                            long du = readI32(data, p + 16) & 0xFFFFFFFFL;
-                            if (ts > 0) dur = du * 1000 / ts; else dur = 0;
-                        }
-                        if (dur > 0) return dur;
-                    }
-                }
-                i++;
-            }
-            return 0;
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
-
-    /** 解析 tkhd 宽高 */
-    private static int[] parseTkhdSize(byte[] data, int from) {
-        try {
-            int i = from;
-            int end = data.length - 4;
-            while (i < end) {
-                if (data[i] == 't' && data[i+1] == 'k' && data[i+2] == 'h' && data[i+3] == 'd') {
-                    int boxSize = readI32(data, i - 4);
-                    if (boxSize >= 80 && boxSize <= 4096) {
-                        int p = i + 4;
-                        int off = data[p] == 1 ? 88 : 76;
-                        int w = (int)((readI32(data, p + off) & 0xFFFFFFFFL) >> 16);
-                        int h = (int)((readI32(data, p + off + 4) & 0xFFFFFFFFL) >> 16);
-                        if (w >= 2 && w <= 19200 && h >= 2 && h <= 19200) {
-                            return new int[]{w, h};
-                        }
-                    }
-                }
-                i++;
-            }
-            return new int[]{0, 0};
-        } catch (Throwable t) {
-            return new int[]{0, 0};
-        }
-    }
-
-    private static int readI32(byte[] b, int off) {
-        return (b[off] & 0xff) << 24 | (b[off+1] & 0xff) << 16 |
-            (b[off+2] & 0xff) << 8 | (b[off+3] & 0xff);
-    }
-
-    private static long readI64(byte[] b, int off) {
-        long hi = readI32(b, off) & 0xFFFFFFFFL;
-        long lo = readI32(b, off + 4) & 0xFFFFFFFFL;
-        return (hi << 32) | lo;
-    }
-
-    /** 从动态照片中提取内嵌 MP4（JPEG 结束后第一个 ftyp box 到文件尾） */
-    private static byte[] extractEmbeddedMp4(File img) throws Exception {
-        try (RandomAccessFile raf = new RandomAccessFile(img, "r")) {
-            long len = raf.length();
-            // 读取整个文件（实况照片一般几 MB）
-            byte[] all = new byte[(int) Math.min(len, 512 * 1024 * 1024)];
-            raf.seek(0);
-            raf.readFully(all);
-
-            // 1. 找 JPEG 结束 FFD9（图片与视频的分界）
-            int jpegEnd = -1;
-            for (int i = all.length - 1; i >= 0; i--) {
-                if (i > 0 && all[i-1] == (byte)0xFF && all[i] == (byte)0xD9) {
-                    jpegEnd = i + 1;
-                    break;
-                }
-            }
-            int searchFrom = Math.max(jpegEnd, 0);
-
-            // 2. 从 JPEG 结束处往后找第一个 ftyp box
-            for (int i = searchFrom; i < all.length - 8; i++) {
-                if (all[i] == 'f' && all[i+1] == 't' && all[i+2] == 'y' && all[i+3] == 'p') {
-                    // box size 在前 4 字节
-                    int sizeOff = i - 4;
-                    if (sizeOff < 0) continue;
-                    int boxSize = (all[sizeOff] & 0xff) << 24 | (all[sizeOff+1] & 0xff) << 16 |
-                        (all[sizeOff+2] & 0xff) << 8 | (all[sizeOff+3] & 0xff);
-                    // boxSize == 0 表示延伸到文件尾，== 1 表示 64 位 size
-                    if (boxSize == 0) {
-                        // 从 ftyp 到文件尾
-                        byte[] mp4 = new byte[all.length - sizeOff];
-                        System.arraycopy(all, sizeOff, mp4, 0, mp4.length);
-                        return mp4;
-                    } else if (boxSize > 0) {
-                        // 从 ftyp 到 box 结束
-                        int end = sizeOff + boxSize;
-                        if (end > all.length) end = all.length;
-                        byte[] mp4 = new byte[end - sizeOff];
-                        System.arraycopy(all, sizeOff, mp4, 0, mp4.length);
-                        return mp4;
-                    }
-                }
-            }
-            // 3. 兜底：从文件尾找最后一个 moov 所在的大 box 起始
-            return null;
-        }
-    }
-
     /** 导出动态照片（简化：返回成功） */
     private static boolean tryExportLivePhoto(String json) {
         try {
@@ -723,19 +557,7 @@ public final class LivePhotoHooks {
     private static final String KEY_WRITTEN_MARK = "_g6_written";
     private static final int EXPT_ID_G6 = 99999;
     private static final int EXPT_ID_SEND = 100000;
-    private static final String VAL_BASE64_ONE = "MQ==";
-
-    private static final String[] ALL_REPAIRER_KEYS = {
-        "RepairerConfig_Chatting_C2C_Live_Preview_V2",
-        "RepairerConfig_Chatting_C2C_Live_Send_V4",
-        "RepairerConfig_Chatting_C2C_Live_Album_Auto_Enable",
-        "RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode",
-        "RepairerConfig_SnsSaveLivePhoto",
-        "RepairerConfig_SnsPublishLivePhoto",
-        "RepairerConfig_SnsCheckSysLivePhoto",
-        "RepairerConfig_SnsPreDownloadLivePhoto",
-        "RepairerConfig_TextStatus_Gallery_LivePhoto_Enable",
-    };
+    // VAL_BASE64_ONE / ALL_REPAIRER_KEYS 已移入共享核心 me.livephoto.common.LivePhotoCodec
 
     private static volatile boolean sPreviewDone = false;
     private static volatile boolean sSendDone = false;
@@ -765,14 +587,18 @@ public final class LivePhotoHooks {
             if (!sPreviewDone || !sSendDone) {
                 Object mkv = mmkv(MMKV_REPAIRER);
                 if (mkv != null) {
-                    for (String key : ALL_REPAIRER_KEYS) {
-                        int target = key.equals("RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode") ? 0 : 1;
+                    boolean repairerDirty = false; // v2.1：批量写完一次 sync（原逐 key sync）
+                    for (String key : LivePhotoCodec.ALL_REPAIRER_KEYS) {
+                        int target = LivePhotoCodec.repairerTargetValue(key); // v2.1: 共享键表（Hevc_Soft_Encode=0，其余=1）
                         if (mmkvGetInt(mkv, key, -1) != target) {
                             mmkvPutInt(mkv, key, target);
-                            mmkvSync(mkv);
-                            dirty = true;
+                            repairerDirty = true;
                             Log.i(TAG, "Repairer written: " + key + "=" + target);
                         }
+                    }
+                    if (repairerDirty) {
+                        mmkvSync(mkv);
+                        dirty = true;
                     }
                 }
                 sPreviewDone = true;
@@ -788,7 +614,7 @@ public final class LivePhotoHooks {
                         Object idMkv = mmkv(uin + "_WxExptAppIdMmkv");
                         if (keyMkv != null && idMkv != null) {
                             mmkvPutInt(keyMkv, KEY_EXPT_SEND, EXPT_ID_SEND);
-                            mmkvPutString(idMkv, String.valueOf(EXPT_ID_SEND), exptJson(EXPT_ID_SEND, KEY_EXPT_SEND));
+                            mmkvPutString(idMkv, String.valueOf(EXPT_ID_SEND), LivePhotoCodec.buildExptJson(EXPT_ID_SEND, KEY_EXPT_SEND));
                             mmkvSync(keyMkv); mmkvSync(idMkv);
                             if (mmkvGetInt(keyMkv, KEY_EXPT_SEND, 0) == EXPT_ID_SEND) {
                                 sExptDone = true; dirty = true;
@@ -812,7 +638,7 @@ public final class LivePhotoHooks {
                             if (mmkvGetInt(keyMkv, KEY_WRITTEN_MARK, 0) != 1) {
                                 mmkvPutInt(keyMkv, KEY_G6, EXPT_ID_G6);
                                 mmkvPutInt(keyMkv, KEY_WRITTEN_MARK, 1);
-                                mmkvPutString(idMkv, String.valueOf(EXPT_ID_G6), exptJson(EXPT_ID_G6, KEY_G6));
+                                mmkvPutString(idMkv, String.valueOf(EXPT_ID_G6), LivePhotoCodec.buildExptJson(EXPT_ID_G6, KEY_G6));
                                 mmkvSync(keyMkv); mmkvSync(idMkv);
                                 Log.i(TAG, "G6 manufacturer expt written");
                             }
@@ -863,25 +689,5 @@ public final class LivePhotoHooks {
         catch (Throwable t) { Log.e(TAG, "sync failed", t); }
     }
 
-    private static String exptJson(int exptId, String key) {
-        // 构造 JSON: {"ExptId":N,"GroupId":0,...}
-        StringBuilder sb = new StringBuilder();
-        char q = '"';
-        sb.append('{').append(q).append("ExptId").append(q).append(':').append(exptId);
-        sb.append(',').append(q).append("GroupId").append(q).append(':').append(0);
-        sb.append(',').append(q).append("ExptSequence").append(q).append(':').append(1);
-        sb.append(',').append(q).append("Priority").append(q).append(':').append(1);
-        sb.append(',').append(q).append("NeedReport").append(q).append(':').append(0);
-        sb.append(',').append(q).append("StartTime").append(q).append(':').append(0);
-        sb.append(',').append(q).append("EndTime").append(q).append(':').append(0);
-        sb.append(',').append(q).append("ExptType").append(q).append(':').append(4);
-        sb.append(',').append(q).append("SvrType").append(q).append(':').append(1);
-        sb.append(',').append(q).append("ExptCheckSum").append(q).append(':').append(q).append(q);
-        sb.append(',').append(q).append("Args").append(q).append(':').append('[').append('{');
-        sb.append(q).append("Key").append(q).append(':').append(q).append(key).append(q);
-        sb.append(',').append(q).append("Val").append(q).append(':').append(q).append(VAL_BASE64_ONE).append(q);
-        sb.append('}').append(']').append('}');
-        return sb.toString();
-    }
 
 }

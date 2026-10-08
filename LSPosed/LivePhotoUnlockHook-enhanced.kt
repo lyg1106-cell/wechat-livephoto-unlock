@@ -10,6 +10,7 @@ import android.provider.MediaStore
 import android.util.Log
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
+import me.livephoto.common.LivePhotoCodec
 import java.io.File
 import java.io.RandomAccessFile
 
@@ -105,7 +106,7 @@ class LivePhotoUnlockHook : XposedModule() {
             } catch (_: Throwable) {}
         }
         // 兜底：扫 APK field_ids，找「持有 LivePhotoCore 类型字段的类」
-        val probed = runCatching { DexProbe.findWrapper(appApkPath()) }.getOrNull() ?: return null
+        val probed = cachedProbeString("wrapper") { DexProbe.findWrapper(appApkPath()) } ?: return null
         return try { Class.forName(probed, false, loader) } catch (_: Throwable) { null }
     }
 
@@ -259,8 +260,9 @@ class LivePhotoUnlockHook : XposedModule() {
                 hook(c).setPriority(PRIORITY_HIGHEST).intercept { _ -> 1 }
                 log(Log.INFO, TAG, "preview config default forced: ${cfg.simpleName}.c() -> 1")
             }.onFailure { log(Log.WARN, TAG, "preview config hook failed", it) }
-            // 门控 a()：先按结构找（a()Z + b(msg)Z 同类），找不到再回退旧名单
-            val gate = runCatching { DexProbe.findViewGate(appApkPath())?.let { Class.forName(it, false, loader) } }.getOrNull()
+            // 门控 a()：先按结构找（a()Z + b(msg)Z 同类），找不到再回退旧名单（v2.1：走缓存）
+            val gateName = cachedProbeString("viewgate") { DexProbe.findViewGate(appApkPath()) }
+            val gate = gateName?.let { runCatching { Class.forName(it, false, loader) }.getOrNull() }
             if (gate != null) {
                 runCatching {
                     hook(gate.getDeclaredMethod("a")).setPriority(PRIORITY_HIGHEST).intercept { _ -> true }
@@ -352,7 +354,7 @@ class LivePhotoUnlockHook : XposedModule() {
         // ----- 直通 Remux 转码：跳过软/硬编直接复制目标文件（解决聊天与朋友圈转码卡死/降级/发表失败） -----
         // 结构探测：同类含「三 String 挂起」+「RecordConfigProvider 挂起」= remux worker（三版验证）
         try {
-            val probed = DexProbe.findRemux(appApkPath())
+            val probed = cachedRemux()
             val remuxCls = probed?.let { p ->
                 runCatching { Class.forName(p.worker, false, loader) }.getOrNull().also {
                     if (it != null) log(Log.INFO, TAG, "dex-probe remux: ${p.worker}.${p.chat}/${p.sns} -> ${p.result}")
@@ -612,42 +614,16 @@ class LivePhotoUnlockHook : XposedModule() {
         return result
     }
 
-    /** 运动照片检测：文件尾部窗口内寻找 MP4 ftyp box 头 */
-    private fun isMotionPhotoFile(path: String): Boolean {
-        return try {
-            val f = File(path)
-            if (!f.isFile || f.length() < 64L) return false
-            val len = f.length()
-            // 1) 头部 XMP 快速检测（XMP 位于 JPEG 头部 APP1 段，128KB 足够）
-            //    先做快路径：命中即返回，避免大文件读取尾部 12MB 的开销
-            val headLen = if (len > 131_072) 131_072 else len.toInt()
-            val head = ByteArray(headLen)
-            RandomAccessFile(f, "r").use { raf ->
-                raf.seek(0)
-                raf.readFully(head)
-            }
-            val headStr = String(head, Charsets.ISO_8859_1)
-            if (headStr.contains("MotionPhoto") || headStr.contains("MicroVideo") || headStr.contains("GCamera")) {
-                return true
-            }
-            // 2) 尾部 ftyp 兜底检测（内嵌式 MP4：小米/魅族/Google 等）
-            val tailLen = if (len > TAIL_WINDOW) TAIL_WINDOW else len.toInt()
-            val tail = ByteArray(tailLen)
-            RandomAccessFile(f, "r").use { raf ->
-                raf.seek(len - tailLen)
-                raf.readFully(tail)
-            }
-            // String.indexOf 走 JVM 内置向量化搜索，远快于逐字节循环
-            String(tail, Charsets.ISO_8859_1).indexOf("ftyp") >= 0
-        } catch (t: Throwable) {
-            log(Log.WARN, TAG, "isMotionPhotoFile($path) error", t)
-            false
-        }
-    }
+    /** 运动照片检测：共享核心（头部 XMP 快检 + 尾部 ftyp 兜底，全程不整文件加载） */
+    private fun isMotionPhotoFile(path: String): Boolean =
+        LivePhotoCodec.isMotionPhotoFile(path)
 
     /**
      * 从 mediaId 对应的图片中提取内嵌 MP4 写到 savePath，
      * 返回微信期望的 JSON；无法完成返回 null。
+     *
+     * v2.1：流式提取——尾部窗口逆向定位 ftyp 后分段拷贝，
+     * 不再整文件 readBytes；时长/宽高只读视频头尾有限区域解析。
      */
     private fun tryExtractVideo(mediaId: Long, savePath: String): String? {
         if (savePath.isEmpty()) return null
@@ -655,22 +631,21 @@ class LivePhotoUnlockHook : XposedModule() {
         val srcPath = resolveImagePaths(app, listOf(mediaId))[mediaId] ?: return null
         return try {
             val src = File(srcPath)
-            val data = src.readBytes()
-            val off = findFtyp(data)
+            val off = LivePhotoCodec.findVideoOffsetInFile(src)
             if (off < 0) return null
             val dst = File(savePath)
-            dst.parentFile?.mkdirs()
-            java.io.FileOutputStream(dst).use { fos ->
-                fos.write(data, off, data.size - off)
-            }
+            val videoLen = LivePhotoCodec.streamCopyRange(src, off, dst)
+            if (videoLen <= 0) return null
             synchronized(sVideoSource) { sVideoSource[dst.absolutePath] = srcPath }
-            val durationMs = parseMvhdDurationMs(data, off)
-            val (w, h) = parseTkhdSize(data, off)
+            val meta = LivePhotoCodec.parseVideoMeta(dst)
+            val durationMs = meta[0]
+            val w = meta[1]
+            val h = meta[2]
             val durField = if (durationMs > 0L) ",\"videoDuration\":$durationMs" else ""
             val sizeField = if (w > 0 && h > 0) ",\"videoWidth\":$w,\"videoHeight\":$h" else ""
             val json =
                 "{\"errorCode\":0,\"videoPath\":\"${dst.absolutePath.replace("\\", "\\\\")}\"," +
-                    "\"videoSize\":${data.size - off}$durField$sizeField,\"coverTimeStampMs\":0}"
+                    "\"videoSize\":$videoLen$durField$sizeField,\"coverTimeStampMs\":0}"
             json
         } catch (t: Throwable) {
             log(Log.ERROR, TAG, "tryExtractVideo($srcPath) failed", t)
@@ -686,7 +661,7 @@ class LivePhotoUnlockHook : XposedModule() {
     /** 构造 remux 结果对象（(ZI) 构造器）：优先用 dex 探测到的结果类，回退已知名单 */
     private fun newRemuxResult(loader: ClassLoader, ok: Boolean): Any? {
         val names = arrayOfNulls<String>(3).also {
-            it[0] = runCatching { DexProbe.findRemux(appApkPath())?.result }.getOrNull()
+            it[0] = cachedRemux()?.result
             it[1] = "re0.e"; it[2] = "ad0.e"
         }
         for (n in names) {
@@ -706,23 +681,94 @@ class LivePhotoUnlockHook : XposedModule() {
     /** 微信 APK 路径（供 DexProbe 扫描；探测失败不影响主流程） */
     private fun appApkPath(): String = sAppContext?.applicationInfo?.sourceDir ?: ""
 
+    // ==================== DexProbe 缓存（v2.1：按微信 versionCode 缓存，避免每次冷启动全量扫描 dex） ====================
+
+    private var sProbeCacheVer = 0L
+    private var sCachedRemux: DexProbe.Remux? = null
+
+    private fun wechatVersionCode(): Long {
+        return try {
+            val ctx = sAppContext ?: return 0L
+            @Suppress("DEPRECATION")
+            ctx.packageManager.getPackageInfo(PKG_WECHAT, 0)?.longVersionCode ?: 0L
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    /** 字符串型探测结果缓存（wrapper / viewgate）；存 "" 表示阴性结果 */
+    private fun cachedProbeString(key: String, probe: () -> String?): String? {
+        val ctx = sAppContext
+        val ver = wechatVersionCode()
+        if (ctx == null || ver == 0L) return runCatching { probe() }.getOrNull()
+        val ck = "v$ver:$key"
+        val prefs = ctx.getSharedPreferences(PREFS_DEXPROBE, Context.MODE_PRIVATE)
+        prefs.getString(ck, null)?.let { cached ->
+            log(Log.DEBUG, TAG, "dexprobe cache hit: $ck")
+            return cached.ifEmpty { null }
+        }
+        val r = runCatching { probe() }.getOrNull()
+        prefs.edit().putString(ck, r ?: "").apply()
+        return r
+    }
+
+    /** remux 探测结果缓存（worker|chat|sns|result 四段序列化） */
+    private fun cachedRemux(): DexProbe.Remux? {
+        val ctx = sAppContext
+        val ver = wechatVersionCode()
+        if (ctx == null || ver == 0L) return runCatching { DexProbe.findRemux(appApkPath()) }.getOrNull()
+        if (sProbeCacheVer == ver && sCachedRemux != null) return sCachedRemux
+        val ck = "v$ver:remux"
+        val prefs = ctx.getSharedPreferences(PREFS_DEXPROBE, Context.MODE_PRIVATE)
+        prefs.getString(ck, null)?.let { cached ->
+            log(Log.DEBUG, TAG, "dexprobe cache hit: $ck")
+            if (cached.isEmpty()) return null
+            val parts = cached.split(" ")
+            if (parts.size == 4) {
+                val r = DexProbe.Remux(parts[0], parts[1], parts[2], parts[3])
+                sCachedRemux = r
+                sProbeCacheVer = ver
+                return r
+            }
+        }
+        val r = runCatching { DexProbe.findRemux(appApkPath()) }.getOrNull()
+        prefs.edit().putString(
+            ck,
+            r?.let { "${it.worker} ${it.chat} ${it.sns} ${it.result}" } ?: ""
+        ).apply()
+        sCachedRemux = r
+        sProbeCacheVer = ver
+        return r
+    }
+
     /** 确保转码产物的封面缩略图存在（若不存在则从源图生成/复制，满足微信 UploadManager 的存在性校验） */
     private fun ensureThumbFile(srcVideoPath: String, thumbPath: String) {
         if (thumbPath.isEmpty()) return
         val dst = File(thumbPath)
         if (dst.isFile && dst.length() > 0L) return
         dst.parentFile?.mkdirs()
-        // 1. 从 sVideoSource 反查原始图片提取首部纯 JPEG
+        // 1. 从 sVideoSource 反查原始图片：只流式读取 [0, 视频起始) 的纯 JPEG 头部
+        //    v2.1：不再整文件 readBytes，大文件只读头部
         val srcImg = synchronized(sVideoSource) { sVideoSource[srcVideoPath] }
         if (!srcImg.isNullOrEmpty()) {
             val f = File(srcImg)
             if (f.isFile && f.length() > 0L) {
                 try {
-                    val data = f.readBytes()
-                    val ftypOff = findFtyp(data)
-                    val jpegLen = if (ftypOff > 0) ftypOff else data.size
-                    java.io.FileOutputStream(dst).use { it.write(data, 0, jpegLen) }
-                    log(Log.INFO, TAG, "thumb generated from srcImg: ${jpegLen}B -> $thumbPath")
+                    val off = LivePhotoCodec.findVideoOffsetInFile(f)
+                    val jpegLen = if (off > 0) off else f.length()
+                    var remaining = jpegLen
+                    RandomAccessFile(f, "r").use { raf ->
+                        java.io.FileOutputStream(dst).use { fos ->
+                            val buf = ByteArray(65536)
+                            while (remaining > 0) {
+                                val n = raf.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                                if (n <= 0) break
+                                fos.write(buf, 0, n)
+                                remaining -= n
+                            }
+                        }
+                    }
+                    log(Log.INFO, TAG, "thumb generated from srcImg: ${jpegLen - remaining}B -> $thumbPath")
                     return
                 } catch (t: Throwable) {
                     log(Log.WARN, TAG, "ensureThumbFile failed from $srcImg", t)
@@ -744,27 +790,15 @@ class LivePhotoUnlockHook : XposedModule() {
         }
     }
 
-    private fun readJpegFile(f: File): ByteArray? {
-        return try {
-            if (!f.isFile || f.length() < 4L) return null
-            val b = f.readBytes()
-            if (b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte()) b else null
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    private fun findEmbeddedVideoIn(b: ByteArray): ByteArray? {
-        val off = findFtyp(b)
-        return if (off >= 0) b.copyOfRange(off, b.size) else null
-    }
-
     /**
      * exportLivePhoto(json) 真实实现。
      * json 字段：{videoPath: 独立视频路径, coverPath: 封面输出, exportPath: 合成动态JPEG输出,
      *            coverTimeStampMs}
      * 行为：image(JPEG) + video(MP4) 直接拼接成动态照片格式写入 exportPath；
      *      封面写 coverPath；确保 videoPath 存在。成功返回 true。
+     *
+     * v2.1：全程 File 流式拼接，不再 ib+vb 产生第三份内存拷贝；
+     *      图像只做 JPEG 魔数校验（2 字节），不读入内容。
      */
     private fun tryExportLivePhoto(json: String): Boolean {
         if (json.isBlank()) return false
@@ -777,146 +811,78 @@ class LivePhotoUnlockHook : XposedModule() {
                 log(Log.WARN, TAG, "export: no exportPath in json")
                 return false
             }
+            val outFile = File(exportPath)
+            outFile.parentFile?.mkdirs()
 
-            // ---- 收集视频字节 ----
-            var videoBytes: ByteArray? = null
+            // ---- 收集视频源（File 优先；缺失时从图像内嵌视频流式提取到临时文件） ----
+            var videoFile: File? = null
+            var tmpVideo: File? = null
             if (videoPath.isNotEmpty()) {
                 val vf = File(videoPath)
-                if (vf.isFile && vf.length() > 64L) videoBytes = vf.readBytes()
+                if (vf.isFile && vf.length() > 64L) videoFile = vf
             }
 
-            // ---- 收集图像字节 ----
-            var imageBytes: ByteArray? = null
-            imageBytes = readJpegFile(File(coverPath))
-            if (imageBytes == null && videoPath.isNotEmpty()) {
-                synchronized(sVideoSource) { imageBytes = readJpegFile(File(sVideoSource[videoPath])) }
+            // ---- 收集图像源（只做 JPEG 魔数校验，不读内容） ----
+            var imageFile: File? = null
+            val coverFile = if (coverPath.isNotEmpty()) File(coverPath) else null
+            if (coverFile != null && LivePhotoCodec.isJpegFile(coverFile)) imageFile = coverFile
+            if (imageFile == null && videoPath.isNotEmpty()) {
+                synchronized(sVideoSource) {
+                    val sf = sVideoSource[videoPath]?.let(::File)
+                    if (sf != null && LivePhotoCodec.isJpegFile(sf)) imageFile = sf
+                }
             }
-            if (imageBytes == null && !coverPath.isNullOrEmpty()) {
+            if (imageFile == null && coverFile?.parentFile?.isDirectory == true) {
                 // 封面路径同目录找同名/任意 jpg 兜底
-                val dir = File(coverPath).parentFile
-                if (dir != null && dir.isDirectory) {
-                    val cand = dir.listFiles { _, name -> name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) }
-                        ?.sortedByDescending { it.lastModified() }?.firstOrNull()
-                    if (cand != null) imageBytes = readJpegFile(cand)
+                val cand = coverFile.parentFile!!.listFiles { _, name -> name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) }
+                    ?.sortedByDescending { it.lastModified() }?.firstOrNull()
+                if (cand != null && LivePhotoCodec.isJpegFile(cand)) imageFile = cand
+            }
+
+            // ---- 图像里若已内嵌视频而视频缺失，反向流式提取到临时文件 ----
+            if (videoFile == null && imageFile != null) {
+                try {
+                    val tmp = File.createTempFile("lpv", ".mp4", outFile.parentFile)
+                    val off = LivePhotoCodec.findVideoOffsetInFile(imageFile)
+                    if (off > 0 && LivePhotoCodec.streamCopyRange(imageFile, off, tmp) > 0) {
+                        videoFile = tmp
+                        tmpVideo = tmp
+                    } else {
+                        tmp.delete()
+                    }
+                } catch (_: Throwable) {
                 }
             }
 
-            // ---- 图像里若已内嵌视频而视频缺失，可反向提取 ----
-            if (videoBytes == null && imageBytes != null) {
-                videoBytes = findEmbeddedVideoIn(imageBytes)
-            }
-            val vb = videoBytes
-            val ib = imageBytes
-            if (vb == null || ib == null) {
-                log(Log.WARN, TAG, "export: missing pieces (img=${ib?.size}, video=${vb?.size})")
+            val img = imageFile
+            val vid = videoFile
+            if (img == null || vid == null) {
+                log(Log.WARN, TAG, "export: missing pieces (img=${img?.absolutePath}, video=${vid?.absolutePath})")
+                tmpVideo?.delete()
                 return false
             }
 
-            // ---- 输出 ----
-            File(exportPath).parentFile?.mkdirs()
-            java.io.FileOutputStream(File(exportPath)).use { it.write(ib + vb) }
-            if (coverPath.isNotEmpty()) {
-                val cf = File(coverPath)
-                cf.parentFile?.mkdirs()
-                if (!cf.isFile) java.io.FileOutputStream(cf).use { it.write(ib) }
+            // ---- 输出：流式拼接 ----
+            java.io.FileOutputStream(outFile).use { out ->
+                java.io.FileInputStream(img).use { it.copyTo(out, 65536) }
+                java.io.FileInputStream(vid).use { it.copyTo(out, 65536) }
             }
-            if (videoPath.isNotEmpty() && !File(videoPath).isFile) {
-                java.io.FileOutputStream(File(videoPath)).use { it.write(vb) }
+            if (coverFile != null) {
+                coverFile.parentFile?.mkdirs()
+                if (!coverFile.isFile) LivePhotoCodec.streamCopyFile(img, coverFile)
             }
+            if (videoPath.isNotEmpty() && !File(videoPath).isFile && tmpVideo != null) {
+                LivePhotoCodec.streamCopyFile(tmpVideo, File(videoPath))
+            }
+            tmpVideo?.delete()
             log(
                 Log.INFO, TAG,
-                "export ok: img=${ib.size}B video=${vb.size}B -> $exportPath"
+                "export ok: img=${img.length()}B video=${vid.length()}B -> $exportPath"
             )
             true
         } catch (t: Throwable) {
             log(Log.ERROR, TAG, "tryExportLivePhoto failed", t)
             false
-        }
-    }
-
-    /** 在视频数据里找 mvhd 解析时长毫秒（全范围扫描 + box 大小合法性校验）；失败返回 0 */
-    private fun parseMvhdDurationMs(data: ByteArray, from: Int): Long {
-        return try {
-            var i = from
-            val end = data.size - 4
-            while (i < end) {
-                if (data[i] == 'm'.code.toByte() && data[i + 1] == 'v'.code.toByte() &&
-                    data[i + 2] == 'h'.code.toByte() && data[i + 3] == 'd'.code.toByte()
-                ) {
-                    // mvhd 前面 4 字节是自身 box size（典型 100~152）
-                    val boxSize = readI32(data, i - 4)
-                    if (boxSize in 80..4096) {
-                        val p = i + 4 // version byte
-                        val dur = if (data[p].toInt() == 1) {
-                            // v1: creation(8) modification(8) timescale(4)@p+20 duration(8)@p+24
-                            val ts = readI32(data, p + 20)
-                            val du = readI64(data, p + 24)
-                            if (ts > 0) du * 1000 / ts else 0L
-                        } else {
-                            // v0: creation(4) modification(4) timescale(4)@p+12 duration(4)@p+16
-                            val ts = readI32(data, p + 12)
-                            val du = readI32(data, p + 16).toLong() and 0xFFFFFFFFL
-                            if (ts > 0) du * 1000 / ts else 0L
-                        }
-                        if (dur > 0) return dur
-                    }
-                }
-                i++
-            }
-            0L
-        } catch (_: Throwable) {
-            0L
-        }
-    }
-
-    private fun readI32(b: ByteArray, o: Int): Int =
-        ((b[o].toInt() and 0xFF) shl 24) or ((b[o + 1].toInt() and 0xFF) shl 16) or
-            ((b[o + 2].toInt() and 0xFF) shl 8) or (b[o + 3].toInt() and 0xFF)
-
-    private fun readI64(b: ByteArray, o: Int): Long {
-        var v = 0L
-        for (k in 0 until 8) v = (v shl 8) or (b[o + k].toLong() and 0xFF)
-        return v
-    }
-
-    /** 反向扫描 ftyp box 头（[size:4]['f','t','y','p']），返回起始偏移或 -1 */
-    private fun findFtyp(buf: ByteArray): Int {
-        var i = buf.size - 8
-        while (i >= 0) {
-            if (buf[i + 4] == 'f'.code.toByte() && buf[i + 5] == 't'.code.toByte() &&
-                buf[i + 6] == 'y'.code.toByte() && buf[i + 7] == 'p'.code.toByte()
-            ) {
-                val sz = readI32(buf, i)
-                if (sz >= 8 && sz < 200_000_000) return i
-            }
-            i--
-        }
-        return -1
-    }
-
-    /** 在视频数据里找 tkhd box 解析宽高（16.16 定点数→整数）；失败返回 (0,0) */
-    private fun parseTkhdSize(data: ByteArray, from: Int): Pair<Int, Int> {
-        return try {
-            var i = from
-            val end = data.size - 4
-            while (i < end) {
-                if (data[i] == 't'.code.toByte() && data[i + 1] == 'k'.code.toByte() &&
-                    data[i + 2] == 'h'.code.toByte() && data[i + 3] == 'd'.code.toByte()
-                ) {
-                    val boxSize = readI32(data, i - 4)
-                    if (boxSize in 80..4096) {
-                        val p = i + 4 // version 字节
-                        val off = if (data[p].toInt() == 1) 88 else 76
-                        val w = ((readI32(data, p + off).toLong() and 0xFFFFFFFFL) ushr 16).toInt()
-                        val h = ((readI32(data, p + off + 4).toLong() and 0xFFFFFFFFL) ushr 16).toInt()
-                        if (w in 2..19200 && h in 2..19200) return Pair(w, h)
-                    }
-                }
-                i++
-            }
-            0 to 0
-        } catch (_: Throwable) {
-            0 to 0
         }
     }
 
@@ -965,15 +931,19 @@ class LivePhotoUnlockHook : XposedModule() {
             var dirty = false
             val mkv = if (!sPreviewDone || !sSendDone) mmkv(MMKV_REPAIRER) else null
 
-            // ---- 批量写入所有实况相关 Repairer 配置 ----
-            for (key in ALL_REPAIRER_KEYS) {
-                // Hevc_Soft_Encode 置 0（禁用软编，走硬件硬编通道）
-                val targetVal = if (key == "RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode") 0 else 1
+            // ---- 批量写入所有实况相关 Repairer 配置（v2.1：写完一次 sync，原逐 key sync） ----
+            var repairerDirty = false
+            for (key in LivePhotoCodec.ALL_REPAIRER_KEYS) {
+                val targetVal = LivePhotoCodec.repairerTargetValue(key)
                 if (mkv != null && mmkvGetInt(mkv, key, -1) != targetVal) {
-                    mmkvPutInt(mkv, key, targetVal); mmkvSync(mkv)
-                    dirty = true
+                    mmkvPutInt(mkv, key, targetVal)
+                    repairerDirty = true
                     log(Log.INFO, TAG, "Repairer written: $key=$targetVal")
                 }
+            }
+            if (repairerDirty && mkv != null) {
+                mmkvSync(mkv)
+                dirty = true
             }
             sPreviewDone = true
             sSendDone = true
@@ -986,7 +956,7 @@ class LivePhotoUnlockHook : XposedModule() {
                     val idMkv = mmkv("${uin}_WxExptAppIdMmkv")
                     if (keyMkv != null && idMkv != null) {
                         mmkvPutInt(keyMkv, KEY_EXPT_SEND, EXPT_ID_SEND)
-                        mmkvPutString(idMkv, EXPT_ID_SEND.toString(), exptJson(EXPT_ID_SEND, KEY_EXPT_SEND))
+                        mmkvPutString(idMkv, EXPT_ID_SEND.toString(), LivePhotoCodec.buildExptJson(EXPT_ID_SEND, KEY_EXPT_SEND))
                         mmkvSync(keyMkv); mmkvSync(idMkv)
                         if (mmkvGetInt(keyMkv, KEY_EXPT_SEND, 0) == EXPT_ID_SEND) {
                             sExptDone = true; dirty = true
@@ -1032,7 +1002,7 @@ class LivePhotoUnlockHook : XposedModule() {
         mmkvPutInt(keyMkv, KEY_G6, EXPT_ID_G6)
         mmkvPutInt(keyMkv, KEY_WRITTEN_MARK, 1)
         val idMkv = mmkv("${uin}_WxExptAppIdMmkv") ?: return
-        mmkvPutString(idMkv, EXPT_ID_G6.toString(), exptJson(EXPT_ID_G6, KEY_G6))
+        mmkvPutString(idMkv, EXPT_ID_G6.toString(), LivePhotoCodec.buildExptJson(EXPT_ID_G6, KEY_G6))
         mmkvSync(keyMkv)
         mmkvSync(idMkv)
 
@@ -1150,17 +1120,7 @@ class LivePhotoUnlockHook : XposedModule() {
 
         private const val MMKV_CLASS = "com.tencent.mmkv.MMKV"
         private const val MMKV_REPAIRER = "Repairer"
-        private val ALL_REPAIRER_KEYS = arrayOf(
-            "RepairerConfig_Chatting_C2C_Live_Preview_V2",
-            "RepairerConfig_Chatting_C2C_Live_Send_V4",
-            "RepairerConfig_Chatting_C2C_Live_Album_Auto_Enable",
-            "RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode",
-            "RepairerConfig_SnsSaveLivePhoto",
-            "RepairerConfig_SnsPublishLivePhoto",
-            "RepairerConfig_SnsCheckSysLivePhoto",
-            "RepairerConfig_SnsPreDownloadLivePhoto",
-            "RepairerConfig_TextStatus_Gallery_LivePhoto_Enable",
-        )
+        // Repairer 键表 / expt JSON / 检测窗口已移入共享核心 me.livephoto.common.LivePhotoCodec
 
         private const val SP_SYSTEM_CONFIG = "system_config_prefs"
         private const val KEY_UIN = "default_uin"
@@ -1173,17 +1133,10 @@ class LivePhotoUnlockHook : XposedModule() {
 
         private val PROJECTION = arrayOf("_id", "_data")
 
-        /** 运动照片尾部检测窗口（MP4 一般 1~3 秒，几 MB 内） */
-        private const val TAIL_WINDOW = 12 * 1024 * 1024
-
-        private const val VAL_BASE64_ONE = "MQ=="
+        /** DexProbe 结果缓存（按微信 versionCode，避免每次冷启动全量扫描 dex） */
+        private const val PREFS_DEXPROBE = "livephoto_dexprobe"
 
         /** Intent 脱敏 byte[] 存储的前缀 key */
         private const val PARCEL_BLOB_PREFIX = "__lp_blob_"
-
-        private fun exptJson(exptId: Int, key: String): String =
-            "{\"ExptId\":$exptId,\"GroupId\":0,\"ExptSequence\":1,\"Priority\":1,\"NeedReport\":0," +
-                "\"StartTime\":0,\"EndTime\":0,\"ExptType\":4,\"SvrType\":1,\"ExptCheckSum\":\"\"," +
-                "\"Args\":[{\"Key\":\"$key\",\"Val\":\"$VAL_BASE64_ONE\"}]}"
     }
 }
