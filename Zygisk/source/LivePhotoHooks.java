@@ -307,11 +307,22 @@ public final class LivePhotoHooks {
         }
     }
 
+    /** v2.1.1：优先用 Context 拿微信自身 APK 路径（最可靠），扫 /data/app 仅作兜底 */
+    private static String findWeChatApk() {
+        try {
+            if (sAppContext != null) {
+                String src = sAppContext.getApplicationInfo().sourceDir;
+                if (src != null && new File(src).isFile()) return src;
+            }
+        } catch (Throwable ignored) {}
+        return DexProbe.findWeChatApkPath();
+    }
+
     /** remux 探测结果缓存（worker chat sns result 空格分隔序列化）；存 "" 表示阴性结果 */
     private static DexProbe.Remux cachedRemux() {
         long ver = wechatVersionCode();
         if (sAppContext == null || ver == 0) {
-            String apkPath = DexProbe.findWeChatApkPath();
+            String apkPath = findWeChatApk();
             return apkPath != null ? DexProbe.findRemux(apkPath) : null;
         }
         if (sProbeCacheVer == ver && sCachedRemux != null) return sCachedRemux;
@@ -331,7 +342,7 @@ public final class LivePhotoHooks {
                     return r;
                 }
             }
-            String apkPath = DexProbe.findWeChatApkPath();
+            String apkPath = findWeChatApk();
             DexProbe.Remux r = apkPath != null ? DexProbe.findRemux(apkPath) : null;
             prefs.edit().putString(ck, r != null
                     ? r.worker + " " + r.chat + " " + r.sns + " " + r.result : "").apply();
@@ -339,7 +350,7 @@ public final class LivePhotoHooks {
             sProbeCacheVer = ver;
             return r;
         } catch (Throwable t) {
-            String apkPath = DexProbe.findWeChatApkPath();
+            String apkPath = findWeChatApk();
             return apkPath != null ? DexProbe.findRemux(apkPath) : null;
         }
     }

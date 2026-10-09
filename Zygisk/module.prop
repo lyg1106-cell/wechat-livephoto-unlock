@@ -1,0 +1,7 @@
+id=livephoto-zygisk
+name=LivePhotoUnlock Zygisk
+version=v2.1.1
+versionCode=211
+author=Operit
+description=微信实况照片解锁 Zygisk 版（流式提取/导出、DexProbe 缓存、共享 LivePhotoCodec 核心）
+minSdkVersion=26

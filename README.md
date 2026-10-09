@@ -63,14 +63,14 @@ expt JSON 构造、Repairer 配置键表。
 纯 Zygisk 方案，**无需 LSPosed**，通过 **Pine Hook 引擎**注入。
 
 **安装步骤**：
-1. KernelSU / Magisk → 安装模块 `LivePhotoUnlock-Zygisk-v2.0.zip`
+1. KernelSU / Magisk → 安装模块 `LivePhotoUnlock-Zygisk-v2.1.1.zip`
 2. 重启手机
 3. 打开微信即可使用
 
 **文件**：
-- `LivePhotoUnlock-Zygisk-v2.0.zip` — 模块包
-- `livephoto_module-v4.dex` — 业务 dex
-- `source/` — 完整源码
+- `LivePhotoUnlock-Zygisk-v2.1.1.zip` — 模块包
+- `source/` — 完整源码（含 `module.prop` / `post-fs-data.sh` / `customize.sh` 打包脚本）
+- `livephoto_module-v4.dex` — 旧版业务 dex（已废弃，v2.1.1 起由源码构建）
 
 ---
 
@@ -118,6 +118,13 @@ expt JSON 构造、Repairer 配置键表。
 前往 [**Releases**](https://github.com/lyg1106-cell/wechat-livephoto-unlock/releases) 下载最新版本。
 
 ---
+
+## 🆕 v2.1.1（2026-10-09，Zygisk 版）
+
+- dex 用 v2.1 源码重新构建（含共享核心 `LivePhotoCodec`，旧 ZIP 内 dex 还是 v2.0 前版本）
+- `DexProbe` 删除废弃代码；微信 APK 路径优先用 `Context.sourceDir` 获取，不再硬扫 `/data/app`
+- `post-fs-data.sh` / `customize.sh` 的 `chown` 改动态获取微信 UID（原来写死的 `u0_a281` 换机失效）
+- `module.prop` / 打包脚本提为正式源码文件；native `.so` 未改动，复用旧版
 
 ## 🆕 v2.1 优化（2026-10-08）
 

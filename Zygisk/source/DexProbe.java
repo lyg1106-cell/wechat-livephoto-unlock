@@ -34,13 +34,13 @@ public final class DexProbe {
     private static final String MSG = "Lcom/tencent/mm/storage/e9;";
     private static final String CORE = "Lcom/motion/core/LivePhotoCore;";
 
-    /** 找微信主 APK 路径（支持 split） */
+    /** 找微信主 APK 路径（支持 split）
+     *  v2.1.1：删除已废弃的 candidates 数组（路径曾误写模块 ID，且从未被使用）；
+     *  调用方（LivePhotoHooks）会优先用 Context.getApplicationInfo().sourceDir，
+     *  这里保留 /data/app 扫描作为兜底。 */
     public static String findWeChatApkPath() {
         try {
-            String[] candidates = {
-                "/data/app/me.livephoto.zygisk/base.apk",
-            };
-            // 优先从系统找到微信的 split base apk
+            // 从系统找到微信的 split base apk
             File dataDir = new File("/data/user/0/com.tencent.mm");
             if (dataDir.isDirectory()) {
                 // 尝试常见 split apk 路径
